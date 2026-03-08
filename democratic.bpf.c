@@ -1,18 +1,3 @@
-/* democratic.bpf.c — v18
- * Adds shared preference state across process boundaries via dem_commstate_map.
- *
- * New in v18:
- *   - dem_commstate_map: BPF_MAP_TYPE_HASH keyed by (tgid << 32 | comm_hash).
- *     Stores the learned preference table for a given thread archetype.
- *   - init_task: newly spawned threads immediately inherit the archetype's preferences.
- *   - exit_task: threads that lived long enough merge their learned scores back
- *     into the shared state using a moving average.
- *
- * New in v17:
- *   - dem_snapshot_map: BPF_MAP_TYPE_HASH keyed by (sample_id << 32 | pid).
- *     Every DEM_SNAPSHOT_INTERVAL_NS, the stopping hook writes a snapshot.
- */
-
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -47,24 +32,39 @@ char _license[] SEC("license") = "GPL";
 #define DEM_RECOVERY_PER_WIN 4
 
 /* ── Reinforcement learning tunables ── */
-#define DEM_LEARN_CYCLES     128
+#define DEM_LEARN_CYCLES     2    /* v22: was 4 — with RL before starvation check, 2 is enough */
 #define DEM_PREF_SLOTS       16
 #define DEM_REINFORCE_POS    3
 #define DEM_REINFORCE_NEG    1
+#define DEM_RECONVERGE_RUNS  16   /* v23: re-election interval — unfreeze after 16 runs post-convergence */
+
+/* v21: minimum runs before a dying thread merges prefs into commstate */
+#define DEM_COMMSTATE_MERGE_MIN_RUNS  2  /* v21: was 8 — let even 2-run threads leave a trace */
+
+/* v21: flush live task prefs into commstate every N runs (not just on death) */
+#define DEM_FLUSH_INTERVAL_RUNS      16  /* v21: was 64 — 4× more frequent flushes */
+
+/* v20: boost stats map indices */
+#define DEM_BOOST_STAT_BOOSTED       0   /* enqueues with vote score > 0 */
+#define DEM_BOOST_STAT_UNBOOSTED     1   /* enqueues with no votes */
+#define DEM_BOOST_STAT_SIZE          2
+
+/* slots merged per flush — limited to keep BPF verifier happy */
+#define DEM_MERGE_SLOTS              2
 
 /* ── Institution detection ── */
 #define DEM_INSTITUTION_BURST_NS  (5ULL * 1000000ULL)
-#define DEM_INSTITUTION_MIN_RUNS  8
+#define DEM_INSTITUTION_MIN_RUNS  4    /* v21: was 8 — detect sooner, free more runs for RL */
 
 /* ── Vote accumulator ── */
 #define DEM_VOTE_ACCUM_SIZE  8192
 #define DEM_VOTE_ACCUM_MASK  (DEM_VOTE_ACCUM_SIZE - 1)
 
 /* ── Snapshot tunables (v17) ── */
-/* Take a snapshot every 10 seconds */
-#define DEM_SNAPSHOT_INTERVAL_NS  (10ULL * 1000000000ULL)
-/* Max snapshot entries: 30 samples × 256 tasks per sample */
-#define DEM_SNAPSHOT_MAX_ENTRIES  (30 * 256)
+/* v21: Take a snapshot every 5 seconds (was 10s) for finer-grained analysis */
+#define DEM_SNAPSHOT_INTERVAL_NS  (5ULL * 1000000000ULL)
+/* Max snapshot entries: 60 samples × 512 tasks per sample (v21: doubled from 30) */
+#define DEM_SNAPSHOT_MAX_ENTRIES  (60 * 512)
 
 #define DEM_DSQ_RT           0ULL
 #define DEM_DSQ_DEMOCRATIC   1ULL
@@ -99,8 +99,10 @@ struct dem_tstate {
     __u8  converged;           /* 0 = learning, 1 = frozen */
     __u8  institution;         /* 1 = short-burst task, bypasses elections */
     __u8  _pad[6];
+    __u32 converged_at_run;    /* v23: run count when last converged, for re-election */
     __u32 last_snapped_sample_id; /* v17c: sample_id of last snapshot written */
     __u64 avg_burst_ns;
+    __u32 votes_fired;      /* v19: cumulative votes cast, never reset */
     __u32 pref_pid[DEM_PREF_SLOTS];
     __s32 pref_score[DEM_PREF_SLOTS];
 };
@@ -150,6 +152,11 @@ struct dem_snap_val {
     __u32 votes_cast;
     /* Aggregate: total votes received (read from accum at snapshot time) */
     __u32 votes_received;
+    /* v19: cumulative votes fired by this task since it was created.
+     * Unlike votes_received (which reads the drainable accumulator),
+     * this counter is only incremented and never reset, giving dem_analyze
+     * a true picture of vote activity across snapshot windows. */
+    __u32 votes_fired;
 };
 
 /* ── v17: Snapshot sequence counter + last snapshot time ── */
@@ -235,6 +242,14 @@ struct {
     __type(value, struct dem_commstate);
 } dem_commstate_map SEC(".maps");
 
+/* v20: Boost instrumentation counters — index 0=boosted, 1=unboosted */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, DEM_BOOST_STAT_SIZE);
+    __type(key,   __u32);
+    __type(value, __u64);
+} dem_boost_stats SEC(".maps");
+
 /* ── Helpers ── */
 
 static __always_inline struct dem_tstate *dem_get(struct task_struct *p)
@@ -295,6 +310,7 @@ static __always_inline void dem_write_snapshot(
     sv.avg_burst_ns   = ts->avg_burst_ns;
     sv.snapshot_ts_ns = snapshot_ts;
     sv.votes_received = votes_received;
+    sv.votes_fired    = ts->votes_fired;
 
     bpf_core_read(sv.comm, sizeof(sv.comm), &p->comm);
 
@@ -316,6 +332,71 @@ static __always_inline void dem_write_snapshot(
     bpf_map_update_elem(&dem_snapshot_map, &sk, &sv, BPF_ANY);
 }
 
+/* ── v20: Shared commstate merge helper ──
+ * Merges this task's top learned preferences into the shared archetype map.
+ * Called from both stopping() (periodic flush) and exit_task() (on death).
+ * Safe to call multiple times — uses moving average so repeated merges
+ * converge rather than amplify noise.
+ */
+static __always_inline void dem_merge_to_commstate(struct task_struct *p,
+                                                    struct dem_tstate *ts)
+{
+    if (ts->institution) return;
+
+    char comm[16] = {};
+    bpf_core_read(comm, sizeof(comm), &p->comm);
+    __u32 chash = dem_comm_hash(comm);
+    __u64 ckey  = ((__u64)ts->tgid << 32) | chash;
+
+    struct dem_commstate *cs = bpf_map_lookup_elem(&dem_commstate_map, &ckey);
+    if (cs) {
+        __u32 mc = cs->merge_count;
+        if (mc > 64) mc = 64;
+
+        #pragma unroll
+        for (int i = 0; i < DEM_MERGE_SLOTS; i++) {
+            __u32 t_pid   = ts->pref_pid[i];
+            __s32 t_score = ts->pref_score[i];
+            if (t_pid == 0 || t_score <= 0) continue;
+
+            int target_slot = -1;
+            int empty_slot  = -1;
+            int min_slot    = -1;
+            __s32 min_score = 0x7FFFFFFF;
+
+            #pragma unroll
+            for (int j = 0; j < DEM_PREF_SLOTS; j++) {
+                if (cs->pref_pid[j] == t_pid) { target_slot = j; break; }
+                if (cs->pref_pid[j] == 0 && empty_slot == -1) empty_slot = j;
+                if (cs->pref_score[j] < min_score) {
+                    min_score = cs->pref_score[j];
+                    min_slot  = j;
+                }
+            }
+
+            if (target_slot >= 0)
+                cs->pref_score[target_slot] =
+                    ((cs->pref_score[target_slot] * mc) + t_score) / (mc + 1);
+            else if (empty_slot >= 0) {
+                cs->pref_pid[empty_slot]   = t_pid;
+                cs->pref_score[empty_slot] = t_score;
+            } else if (min_slot >= 0 && t_score > cs->pref_score[min_slot]) {
+                cs->pref_pid[min_slot]   = t_pid;
+                cs->pref_score[min_slot] = t_score;
+            }
+        }
+        if (cs->merge_count < 65535) cs->merge_count++;
+    } else {
+        struct dem_commstate new_cs = {};
+        new_cs.merge_count = 1;
+        for (int i = 0; i < DEM_PREF_SLOTS; i++) {
+            new_cs.pref_pid[i]   = ts->pref_pid[i];
+            new_cs.pref_score[i] = ts->pref_score[i];
+        }
+        bpf_map_update_elem(&dem_commstate_map, &ckey, &new_cs, BPF_ANY);
+    }
+}
+
 /* ── Ops ── */
 
 int SCX_OPS_SLEEPABLE(democratic_init)
@@ -324,7 +405,7 @@ int SCX_OPS_SLEEPABLE(democratic_init)
     e = scx_bpf_create_dsq(DEM_DSQ_RT,         -1); if (e) return e;
     e = scx_bpf_create_dsq(DEM_DSQ_DEMOCRATIC, -1); if (e) return e;
     e = scx_bpf_create_dsq(DEM_DSQ_FALLBACK,   -1); if (e) return e;
-    bpf_printk("democratic v18: shared preference state\n");
+    bpf_printk("democratic v23: re-elections every %d runs\n", DEM_RECONVERGE_RUNS);
     return 0;
 }
 
@@ -355,12 +436,17 @@ int SCX_OPS_SLEEPABLE(democratic_init_task,
     __u64 ckey = ((__u64)ts->tgid << 32) | chash;
     struct dem_commstate *cs = bpf_map_lookup_elem(&dem_commstate_map, &ckey);
     if (cs) {
+        __u8 has_prefs = 0;
         for (int i = 0; i < DEM_PREF_SLOTS; i++) {
             ts->pref_pid[i]   = cs->pref_pid[i];
             ts->pref_score[i] = cs->pref_score[i];
+            if (cs->pref_score[i] > 0)
+                has_prefs = 1;
         }
-        /* Automatically converge if inherited pool is highly mature */
-        if (cs->merge_count >= 16) {
+        /* v21: only auto-converge if inherited prefs actually contain
+         * non-zero positive scores. Prevents freezing on empty commstate
+         * entries that have high merge counts but no real preference data. */
+        if (cs->merge_count >= 4 && has_prefs) {
             ts->converged = 1;
         }
     }
@@ -389,12 +475,11 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    if ((now - ts->last_run_ts) > DEM_STARVE_NS) {
-        __sync_fetch_and_add(&ts->starvation_rescues, 1);
-        scx_bpf_dsq_insert(p, DEM_DSQ_FALLBACK, DEM_SLICE_NS, enq_flags);
-        return 0;
-    }
-
+    /* ── v22: RL learning runs BEFORE starvation check ──
+     * Previously, any task waiting >20ms hit the starvation early-return
+     * and skipped RL entirely. Desktop tasks routinely wait >20ms between
+     * creation and first enqueue, wasting their first (sometimes only)
+     * enqueue cycle. Now every non-institution enqueue feeds the RL. */
     if (!ts->converged) {
         __u32 zero = 0;
         struct dem_winner *w = bpf_map_lookup_elem(&dem_winner_map, &zero);
@@ -444,9 +529,33 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
             ts->prev_metric = metric;
         }
 
-        if (ts->runs >= DEM_LEARN_CYCLES && !ts->converged) {
+        if ((ts->runs - ts->converged_at_run) >= DEM_LEARN_CYCLES &&
+            !ts->converged) {
             ts->converged = 1;
+            ts->converged_at_run = ts->runs;
+            /* v23: merge prefs on every convergence (including re-elections)
+             * so commstate improves over successive learning cycles. */
+            dem_merge_to_commstate(p, ts);
         }
+    }
+
+    /* ── v23: Re-election trigger ──
+     * Long-lived tasks that converged long ago may hold stale preferences.
+     * After DEM_RECONVERGE_RUNS dispatches since last convergence, unfreeze
+     * the task so it re-enters the RL learning window for another
+     * DEM_LEARN_CYCLES cycle, then refreezes with updated preferences. */
+    if (ts->converged &&
+        (ts->runs - ts->converged_at_run) >= DEM_RECONVERGE_RUNS) {
+        ts->converged = 0;
+        ts->prev_metric = 0;  /* need fresh metric seed */
+        ts->converged_at_run = ts->runs;  /* anchor for next convergence check */
+    }
+
+    /* ── Starvation rescue (after RL) ── */
+    if ((now - ts->last_run_ts) > DEM_STARVE_NS) {
+        __sync_fetch_and_add(&ts->starvation_rescues, 1);
+        scx_bpf_dsq_insert(p, DEM_DSQ_FALLBACK, DEM_SLICE_NS, enq_flags);
+        return 0;
     }
 
     __u32 vote_idx = pid & DEM_VOTE_ACCUM_MASK;
@@ -473,6 +582,11 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         else
             ts->irrelevance = 0;
 
+        /* v20: count boosted enqueue */
+        __u32 bs_idx = DEM_BOOST_STAT_BOOSTED;
+        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
+        if (bs) __sync_fetch_and_add(bs, 1);
+
     } else {
         if (ts->irrelevance < DEM_IRRELEVANCE_CAP)
             ts->irrelevance++;
@@ -484,6 +598,11 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
             __u64 burst_nudge = ts->avg_burst_ns >> 10;
             vtime += burst_nudge;
         }
+
+        /* v20: count unboosted enqueue */
+        __u32 bs_idx = DEM_BOOST_STAT_UNBOOSTED;
+        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
+        if (bs) __sync_fetch_and_add(bs, 1);
     }
 
     scx_bpf_dsq_insert_vtime(p, DEM_DSQ_DEMOCRATIC,
@@ -496,25 +615,16 @@ int SCX_OPS(democratic_dispatch, s32 cpu, struct task_struct *prev)
     if (scx_bpf_dsq_move_to_local(DEM_DSQ_RT))
         return 0;
 
-    if (dem_gamemode_on()) {
-        if (scx_bpf_dsq_move_to_local(DEM_DSQ_DEMOCRATIC))
-            return 0;
-        scx_bpf_dsq_move_to_local(DEM_DSQ_FALLBACK);
+    /* v22: always serve DEMOCRATIC first, then FALLBACK.
+     * The old adaptive queue-depth logic (dem_q >= fb_q) starved
+     * DEMOCRATIC under asymmetric load — e.g. hackbench flooding
+     * FALLBACK with 640 starvation-rescued tasks caused a runnable
+     * task stall (38s) on a claude process sitting in DEMOCRATIC.
+     * DEMOCRATIC holds voted/RL-routed tasks; they deserve priority.
+     * FALLBACK drains when DEMOCRATIC is empty (the common case). */
+    if (scx_bpf_dsq_move_to_local(DEM_DSQ_DEMOCRATIC))
         return 0;
-    }
-
-    __u32 dem_q = scx_bpf_dsq_nr_queued(DEM_DSQ_DEMOCRATIC);
-    __u32 fb_q  = scx_bpf_dsq_nr_queued(DEM_DSQ_FALLBACK);
-
-    if (dem_q >= fb_q) {
-        if (scx_bpf_dsq_move_to_local(DEM_DSQ_DEMOCRATIC))
-            return 0;
-        scx_bpf_dsq_move_to_local(DEM_DSQ_FALLBACK);
-    } else {
-        if (scx_bpf_dsq_move_to_local(DEM_DSQ_FALLBACK))
-            return 0;
-        scx_bpf_dsq_move_to_local(DEM_DSQ_DEMOCRATIC);
-    }
+    scx_bpf_dsq_move_to_local(DEM_DSQ_FALLBACK);
     return 0;
 }
 
@@ -614,6 +724,16 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
         }
     }
 
+    /* ── Step 1b: v20 periodic commstate flush ──
+     * Long-lived tasks never hit exit_task, so they'd never contribute
+     * learned prefs to shared state. Flush every DEM_FLUSH_INTERVAL_RUNS
+     * so commstate warms up while tasks are alive.
+     */
+    if (!ts->institution && ts->runs > 0 &&
+        (ts->runs % DEM_FLUSH_INTERVAL_RUNS) == 0) {
+        dem_merge_to_commstate(p, ts);
+    }
+
     /* ── Step 2: Cast votes from inline preference table ── */
     {
         __s32 best_score = 0;
@@ -631,6 +751,8 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
             __u32 *va = bpf_map_lookup_elem(&dem_vote_accum, &vote_idx);
             if (va)
                 __sync_fetch_and_add(va, (__u32)best_score);
+            /* v19: track cumulative vote activity */
+            __sync_fetch_and_add(&ts->votes_fired, 1);
             return 0;
         }
     }
@@ -648,6 +770,9 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
         if (va)
             __sync_fetch_and_add(va, DEM_MAX_VOTES - i);
     }
+    /* v19: count fallback votes too */
+    if (n > 0)
+        __sync_fetch_and_add(&ts->votes_fired, 1);
     return 0;
 }
 
@@ -657,68 +782,9 @@ int SCX_OPS(democratic_exit_task, struct task_struct *p,
     __u32 pid = BPF_CORE_READ(p, pid);
     struct dem_tstate *ts = dem_get(p);
 
-    /* ── v18: Merge learned preferences into shared comm state ── */
-    if (ts && !ts->institution && (ts->converged || ts->runs > DEM_LEARN_CYCLES / 2)) {
-        char comm[16] = {};
-        bpf_core_read(comm, sizeof(comm), &p->comm);
-        __u32 chash = dem_comm_hash(comm);
-        __u64 ckey = ((__u64)ts->tgid << 32) | chash;
-
-        struct dem_commstate *cs = bpf_map_lookup_elem(&dem_commstate_map, &ckey);
-        if (cs) {
-            __u32 mc = cs->merge_count;
-            if (mc > 64) mc = 64; /* Cap moving average */
-
-            /* Only process the top 2 preferred slots from the task to save BPF verifier budget */
-            #define DEM_MERGE_SLOTS 2
-            for (int i = 0; i < DEM_MERGE_SLOTS; i++) {
-                __u32 t_pid = ts->pref_pid[i];
-                __s32 t_score = ts->pref_score[i];
-                if (t_pid == 0 || t_score <= 0) continue;
-
-                /* Find this PID in the shared state, or an empty slot, or the minimum score slot */
-                int target_slot = -1;
-                int empty_slot = -1;
-                int min_slot = -1;
-                __s32 min_score = 0x7FFFFFFF;
-
-                #pragma unroll
-                for (int j = 0; j < DEM_PREF_SLOTS; j++) {
-                    if (cs->pref_pid[j] == t_pid) {
-                        target_slot = j;
-                        break;
-                    }
-                    if (cs->pref_pid[j] == 0 && empty_slot == -1) {
-                        empty_slot = j;
-                    }
-                    if (cs->pref_score[j] < min_score) {
-                        min_score = cs->pref_score[j];
-                        min_slot = j;
-                    }
-                }
-
-                if (target_slot >= 0) {
-                    cs->pref_score[target_slot] = ((cs->pref_score[target_slot] * mc) + t_score) / (mc + 1);
-                } else if (empty_slot >= 0) {
-                    cs->pref_pid[empty_slot] = t_pid;
-                    cs->pref_score[empty_slot] = t_score;
-                } else if (min_slot >= 0 && t_score > cs->pref_score[min_slot]) {
-                    cs->pref_pid[min_slot] = t_pid;
-                    cs->pref_score[min_slot] = t_score;
-                }
-            }
-            if (cs->merge_count < 65535) cs->merge_count++;
-            if (cs->merge_count < 65535) cs->merge_count++;
-        } else {
-            /* Create new archetype entry */
-            struct dem_commstate new_cs = {};
-            new_cs.merge_count = 1;
-            for (int i = 0; i < DEM_PREF_SLOTS; i++) {
-                new_cs.pref_pid[i]   = ts->pref_pid[i];
-                new_cs.pref_score[i] = ts->pref_score[i];
-            }
-            bpf_map_update_elem(&dem_commstate_map, &ckey, &new_cs, BPF_ANY);
-        }
+    /* ── v18/v20: Merge learned preferences into shared comm state ── */
+    if (ts && !ts->institution && (ts->converged || ts->runs > DEM_COMMSTATE_MERGE_MIN_RUNS)) {
+        dem_merge_to_commstate(p, ts);
     }
 
     bpf_map_delete_elem(&dem_vote_map, &pid);
@@ -732,7 +798,7 @@ int SCX_OPS(democratic_exit_task, struct task_struct *p,
 
 int SCX_OPS(democratic_exit, struct scx_exit_info *ei)
 {
-    bpf_printk("democratic v18: unloading\n");
+    bpf_printk("democratic v23: unloading\n");
     scx_bpf_destroy_dsq(DEM_DSQ_RT);
     scx_bpf_destroy_dsq(DEM_DSQ_DEMOCRATIC);
     scx_bpf_destroy_dsq(DEM_DSQ_FALLBACK);
