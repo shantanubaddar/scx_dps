@@ -1,24 +1,3 @@
-/* democratic_loader.c — v18
- * Loads the democratic v18 scheduler BPF object and optionally seeds the
- * static vote map as a bootstrap hint. Reinforcement learning in the BPF
- * program builds per-task preferences; institutions bypass elections entirely.
- *
- * New in v18:
- *   - Compatible with v18 BPF (shared preference state via dem_commstate_map).
- *   - Automatically saves and loads shared preferences to/from disk at
- *     /tmp/democratic_commstate to preserve memory across reboots/restarts.
- *
- * New in v8:
- *   - Compatible with v17 BPF (snapshot map for preference drift analysis).
- *   - Pins dem_snapshot_map and dem_snap_seq_map to /sys/fs/bpf/ after load.
- *
- * Usage:
- *   sudo ./democratic_loader democratic.bpf.o [workload_pid] [--gamemode]
- *
- * If no PID given, watches for game_* threads system-wide.
- * Send SIGUSR1 to toggle gamemode at runtime.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +14,8 @@
 /* Pin paths for snapshot maps — shared with dem_analyze */
 #define DEM_PIN_SNAPSHOT  "/sys/fs/bpf/dem_snapshot_map"
 #define DEM_PIN_SEQ       "/sys/fs/bpf/dem_snap_seq_map"
+#define DEM_PIN_COMMSTATE "/sys/fs/bpf/dem_commstate_map"  /* v19 */
+#define DEM_PIN_BOOSTSTATS "/sys/fs/bpf/dem_boost_stats"   /* v20 */
 
 /* Must match democratic.bpf.c exactly */
 #define DEM_MAX_VOTES   8
@@ -523,6 +504,30 @@ int main(int argc, char **argv)
 
             if (pin_ok)
                 printf("  dem_analyze can now attach to live snapshot maps.\n");
+
+            /* v19: also pin commstate map for live dem_analyze access */
+            unlink(DEM_PIN_COMMSTATE);
+            struct bpf_map *cs_map = bpf_object__find_map_by_name(obj,
+                                                                    "dem_commstate_map");
+            if (cs_map) {
+                if (bpf_map__pin(cs_map, DEM_PIN_COMMSTATE) == 0)
+                    printf("  Pinned dem_commstate_map → %s\n", DEM_PIN_COMMSTATE);
+                else
+                    printf("  Warning: could not pin dem_commstate_map: %s\n",
+                           strerror(errno));
+            }
+
+            /* v20: pin boost stats map */
+            unlink(DEM_PIN_BOOSTSTATS);
+            struct bpf_map *bs_map = bpf_object__find_map_by_name(obj,
+                                                                    "dem_boost_stats");
+            if (bs_map) {
+                if (bpf_map__pin(bs_map, DEM_PIN_BOOSTSTATS) == 0)
+                    printf("  Pinned dem_boost_stats   → %s\n", DEM_PIN_BOOSTSTATS);
+                else
+                    printf("  Warning: could not pin dem_boost_stats: %s\n",
+                           strerror(errno));
+            }
         }
     }
 
@@ -626,12 +631,14 @@ int main(int argc, char **argv)
         save_commstate(commstate_map_fd);
     }
 
-    /* ── Unpin snapshot maps ── */
+    /* ── Unpin maps ── */
     unlink(DEM_PIN_SNAPSHOT);
     unlink(DEM_PIN_SEQ);
+    unlink(DEM_PIN_COMMSTATE);  /* v19 */
+    unlink(DEM_PIN_BOOSTSTATS); /* v20 */
 
     bpf_link__destroy(link);
     bpf_object__close(obj);
-    printf("\n  Democratic scheduler v18 unloaded. Reverted to BORE.\n\n");
+    printf("\n  Democratic scheduler v19 unloaded. Reverted to BORE.\n\n");
     return 0;
 }
