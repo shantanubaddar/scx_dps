@@ -1,3 +1,91 @@
+/* democratic.bpf.c — v25
+ * Universal suffrage + waker identity voting
+ *
+ * New in v25:
+ *   - Waker identity: select_cpu() runs in the waker's context, so
+ *     bpf_get_current_task() gives us the waker PID. Stored in the wakee's
+ *     dem_tstate::waker_pid. In enqueue(), every woken task (SCX_ENQ_WAKEUP)
+ *     casts a vote for its waker into dem_vote_accum — including institutions.
+ *     This is the "micro-election" that gives every task a democratic voice,
+ *     even sub-millisecond tasks that bypass the democratic queue.
+ *   - Commstate flush guard: periodic flush in stopping() now skips converged
+ *     tasks (they already merged at convergence time). Eliminates redundant
+ *     writes under high task counts sharing the same comm name.
+ *   - RT lane counter: DEM_BOOST_STAT_RT tracks RT-lane enqueue count
+ *     for observability.
+ *
+ * Adaptive convergence + institution fast-path + drift-triggered re-elections
+ *
+ * New in v24:
+ *   - Adaptive convergence: instead of a fixed 2-cycle learning window for all
+ *     tasks, the window grows exponentially with each re-election cycle:
+ *     min(DEM_LEARN_CYCLES_BASE << convergence_count, DEM_LEARN_CYCLES_MAX)
+ *     giving windows of 2, 4, 8, 16 runs.  Long-lived tasks get progressively
+ *     deeper learning, ephemeral ones still converge fast.
+ *   - dem_tstate gains convergence_count: how many times this task has converged.
+ *   - Institution fast-path in enqueue(): warmstarted tasks whose inherited
+ *     avg_burst_ns is already below the institution threshold skip the
+ *     democratic queue from their very first enqueue — no more waiting 4 runs.
+ *   - DEM_INSTITUTION_MIN_RUNS lowered 4 → 2: tasks that weren't warmstarted
+ *     still get detected faster.
+ *   - Drift-triggered re-elections: converged tasks continue observing their
+ *     metric (without doing RL updates). An EMA of the metric is compared
+ *     against the metric at convergence time. If performance degrades by >50%,
+ *     a re-election is triggered immediately. DEM_RECONVERGE_RUNS raised to
+ *     128 as a safety ceiling — drift detection handles the normal case.
+ *
+ * New in v23:
+ *   - RL learning block moved BEFORE the starvation rescue in enqueue().
+ *     Previously, any task whose first enqueue waited >20ms (normal for
+ *     desktop tasks created ahead of time) would hit the starvation
+ *     early-return and skip RL entirely. Now RL always runs.
+ *   - DEM_LEARN_CYCLES reduced 4 → 2: with RL no longer skipped, a task
+ *     converges after just 2 dispatches — seed metric on enqueue #1,
+ *     produce a preference on enqueue #2, converge.
+ *
+ * New in v21:
+ *   - DEM_LEARN_CYCLES reduced 32 → 4: desktop tasks peak at ~7 runs before
+ *     dying. A threshold of 4 means most will converge in time.
+ *   - DEM_COMMSTATE_MERGE_MIN_RUNS reduced 8 → 2: even ephemeral 2-run
+ *     threads contribute preferences to shared state.
+ *   - DEM_INSTITUTION_MIN_RUNS reduced 8 → 4: institutions detected sooner
+ *     so the remaining non-institution runs go to RL rather than being
+ *     wasted on pre-institution learning.
+ *   - DEM_FLUSH_INTERVAL_RUNS reduced 64 → 16: long-lived tasks flush to
+ *     commstate 4× more often.
+ *   - DEM_SNAPSHOT_INTERVAL_NS reduced 10s → 5s: finer-grained snapshots
+ *     for dem_analyze to capture voting activity as it happens.
+ *
+ * New in v20:
+ *   - dem_merge_to_commstate(): shared helper extracted from exit_task.
+ *     Called from stopping() every DEM_FLUSH_INTERVAL_RUNS runs so long-lived
+ *     tasks contribute learned preferences without waiting to die.
+ *   - dem_boost_stats map: two counters (boosted / unboosted enqueue decisions)
+ *     pinned to bpffs so dem_analyze can report what % of scheduling decisions
+ *     are actually vote-influenced. Direct measurement of RL effectiveness.
+ *
+ * New in v19:
+ *   - DEM_LEARN_CYCLES reduced 128 → 32: most desktop threads never hit
+ *     128 runs; lower threshold means real tasks start converging.
+ *   - commstate merge threshold reduced DEM_LEARN_CYCLES/2 → 8: threads
+ *     contribute learned preferences back to shared state after just 8 runs,
+ *     allowing ephemeral threads to still leave a trace.
+ *   - dem_snap_val gains votes_fired field: cumulative vote counter incremented
+ *     at cast time, never drained, giving dem_analyze a true picture of vote
+ *     activity rather than the instantaneous (always-zero) accumulator snapshot.
+ *
+ * New in v18:
+ *   - dem_commstate_map: BPF_MAP_TYPE_HASH keyed by comm_hash.
+ *     Stores the learned preference table for a given thread archetype.
+ *   - init_task: newly spawned threads immediately inherit the archetype's preferences.
+ *   - exit_task: threads that lived long enough merge their learned scores back
+ *     into the shared state using a moving average.
+ *
+ * New in v17:
+ *   - dem_snapshot_map: BPF_MAP_TYPE_HASH keyed by (sample_id << 32 | pid).
+ *     Every DEM_SNAPSHOT_INTERVAL_NS, the stopping hook writes a snapshot.
+ */
+
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -32,11 +120,13 @@ char _license[] SEC("license") = "GPL";
 #define DEM_RECOVERY_PER_WIN 4
 
 /* ── Reinforcement learning tunables ── */
-#define DEM_LEARN_CYCLES     2    /* v22: was 4 — with RL before starvation check, 2 is enough */
+#define DEM_LEARN_CYCLES_BASE  2   /* v24: base learning window (first convergence) */
+#define DEM_LEARN_CYCLES_MAX   16  /* v24: cap — never learn more than 16 cycles */
 #define DEM_PREF_SLOTS       16
 #define DEM_REINFORCE_POS    3
 #define DEM_REINFORCE_NEG    1
-#define DEM_RECONVERGE_RUNS  16   /* v23: re-election interval — unfreeze after 16 runs post-convergence */
+#define DEM_RECONVERGE_RUNS  128  /* v24: safety ceiling — drift detection handles normal case */
+#define DEM_DRIFT_THRESHOLD_SHIFT  1  /* v24: re-elect when metric_ema > converged_metric + (converged_metric >> 1) = 50% worse */
 
 /* v21: minimum runs before a dying thread merges prefs into commstate */
 #define DEM_COMMSTATE_MERGE_MIN_RUNS  2  /* v21: was 8 — let even 2-run threads leave a trace */
@@ -47,14 +137,15 @@ char _license[] SEC("license") = "GPL";
 /* v20: boost stats map indices */
 #define DEM_BOOST_STAT_BOOSTED       0   /* enqueues with vote score > 0 */
 #define DEM_BOOST_STAT_UNBOOSTED     1   /* enqueues with no votes */
-#define DEM_BOOST_STAT_SIZE          2
+#define DEM_BOOST_STAT_RT            2   /* RT-lane enqueues */
+#define DEM_BOOST_STAT_SIZE          3
 
 /* slots merged per flush — limited to keep BPF verifier happy */
 #define DEM_MERGE_SLOTS              2
 
 /* ── Institution detection ── */
 #define DEM_INSTITUTION_BURST_NS  (5ULL * 1000000ULL)
-#define DEM_INSTITUTION_MIN_RUNS  4    /* v21: was 8 — detect sooner, free more runs for RL */
+#define DEM_INSTITUTION_MIN_RUNS  2    /* v24: was 4 — detect even sooner for p50 latency */
 
 /* ── Vote accumulator ── */
 #define DEM_VOTE_ACCUM_SIZE  8192
@@ -98,11 +189,15 @@ struct dem_tstate {
     __u64 prev_metric;
     __u8  converged;           /* 0 = learning, 1 = frozen */
     __u8  institution;         /* 1 = short-burst task, bypasses elections */
-    __u8  _pad[6];
+    __u8  _pad[2];
+    __u32 convergence_count;   /* v24: how many times this task has converged */
     __u32 converged_at_run;    /* v23: run count when last converged, for re-election */
+    __u64 converged_metric;    /* v24: metric snapshot at convergence — drift baseline */
+    __u64 metric_ema;          /* v24: running EMA of metric, updated even when converged */
     __u32 last_snapped_sample_id; /* v17c: sample_id of last snapshot written */
     __u64 avg_burst_ns;
     __u32 votes_fired;      /* v19: cumulative votes cast, never reset */
+    __u32 waker_pid;        /* v25: PID of last waker, set in select_cpu */
     __u32 pref_pid[DEM_PREF_SLOTS];
     __s32 pref_score[DEM_PREF_SLOTS];
 };
@@ -191,14 +286,14 @@ struct {
 } dem_vote_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key,   __u32);
     __type(value, struct dem_winner);
 } dem_winner_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, DEM_VOTE_ACCUM_SIZE);
     __type(key,   __u32);
     __type(value, __u32);
@@ -346,7 +441,7 @@ static __always_inline void dem_merge_to_commstate(struct task_struct *p,
     char comm[16] = {};
     bpf_core_read(comm, sizeof(comm), &p->comm);
     __u32 chash = dem_comm_hash(comm);
-    __u64 ckey  = ((__u64)ts->tgid << 32) | chash;
+    __u64 ckey  = (__u64)chash;
 
     struct dem_commstate *cs = bpf_map_lookup_elem(&dem_commstate_map, &ckey);
     if (cs) {
@@ -405,7 +500,7 @@ int SCX_OPS_SLEEPABLE(democratic_init)
     e = scx_bpf_create_dsq(DEM_DSQ_RT,         -1); if (e) return e;
     e = scx_bpf_create_dsq(DEM_DSQ_DEMOCRATIC, -1); if (e) return e;
     e = scx_bpf_create_dsq(DEM_DSQ_FALLBACK,   -1); if (e) return e;
-    bpf_printk("democratic v23: re-elections every %d runs\n", DEM_RECONVERGE_RUNS);
+    bpf_printk("democratic v25: universal suffrage + waker identity\n");
     return 0;
 }
 
@@ -433,7 +528,7 @@ int SCX_OPS_SLEEPABLE(democratic_init_task,
     }
 
     /* ── v18: Inherit shared preferences from comm state ── */
-    __u64 ckey = ((__u64)ts->tgid << 32) | chash;
+    __u64 ckey = (__u64)chash;
     struct dem_commstate *cs = bpf_map_lookup_elem(&dem_commstate_map, &ckey);
     if (cs) {
         __u8 has_prefs = 0;
@@ -454,6 +549,42 @@ int SCX_OPS_SLEEPABLE(democratic_init_task,
     return 0;
 }
 
+/* ── v25: select_cpu — idle CPU fast-path + waker identity ──
+ * select_cpu() runs in the WAKER's context. bpf_get_current_task() returns
+ * the waker, not the wakee (p). We store the waker PID in the wakee's
+ * tstate so enqueue() can cast a vote for it — giving every task,
+ * including institutions, a democratic voice.
+ */
+int SCX_OPS(democratic_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+    bool is_idle = false;
+    s32 cpu;
+
+    /* v25: Record waker identity before anything else */
+    struct dem_tstate *ts = dem_get(p);
+    if (ts) {
+        struct task_struct *waker = (struct task_struct *)bpf_get_current_task();
+        __u32 wpid = BPF_CORE_READ(waker, pid);
+        __u32 my_pid = BPF_CORE_READ(p, pid);
+        if (wpid != 0 && wpid != my_pid)
+            ts->waker_pid = wpid;
+    }
+
+    cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+
+    if (is_idle) {
+        /* Idle CPU found — direct dispatch, bypass enqueue entirely.
+         * Use RT slice for institutions, normal slice otherwise. */
+        __u64 slice = DEM_SLICE_NS;
+        if (ts && ts->institution)
+            slice = DEM_SLICE_RT_NS;
+
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+    }
+
+    return cpu;
+}
+
 int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
 {
     __u32 pid = BPF_CORE_READ(p, pid);
@@ -461,6 +592,9 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
     struct dem_tstate *ts = dem_get(p);
 
     if (dem_is_rt(p)) {
+        __u32 bs_idx = DEM_BOOST_STAT_RT;
+        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
+        if (bs) __sync_fetch_and_add(bs, 1);
         scx_bpf_dsq_insert(p, DEM_DSQ_RT, DEM_SLICE_RT_NS, enq_flags);
         return 0;
     }
@@ -470,16 +604,47 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    if (ts->institution) {
-        scx_bpf_dsq_insert(p, DEM_DSQ_FALLBACK, DEM_SLICE_RT_NS, enq_flags);
-        return 0;
+    /* ── v25: Universal waker voting ──
+     * Every woken task — including institutions — votes for its waker.
+     * select_cpu() stored the waker PID in ts->waker_pid (it runs in
+     * the waker's context).  This is the democratic "micro-election":
+     * institutions don't need multi-round RL to participate — one
+     * wakeup = one vote.  The vote goes into the same accumulator
+     * that boosts vtime for tasks in the democratic queue. */
+    if ((enq_flags & 1ULL) && ts->waker_pid != 0 && ts->waker_pid != pid) {
+        __u32 vote_idx = ts->waker_pid & DEM_VOTE_ACCUM_MASK;
+        __u32 *va = bpf_map_lookup_elem(&dem_vote_accum, &vote_idx);
+        if (va)
+            __sync_fetch_and_add(va, 1);
+        __sync_fetch_and_add(&ts->votes_fired, 1);
     }
 
-    /* ── v22: RL learning runs BEFORE starvation check ──
-     * Previously, any task waiting >20ms hit the starvation early-return
-     * and skipped RL entirely. Desktop tasks routinely wait >20ms between
-     * creation and first enqueue, wasting their first (sometimes only)
-     * enqueue cycle. Now every non-institution enqueue feeds the RL. */
+    /* ── v25: Early vote drain — before any routing decision ──
+     * Drain this task's received votes NOW so institutions can benefit too.
+     * Previously the drain sat after institution routing, meaning 99% of
+     * desktop tasks (institutions) never consumed their votes. */
+    __u32 vote_idx = pid & DEM_VOTE_ACCUM_MASK;
+    __u32 *accum = bpf_map_lookup_elem(&dem_vote_accum, &vote_idx);
+    __u32 score = 0;
+    if (accum && *accum > 0) {
+        score = __sync_lock_test_and_set(accum, 0);
+    }
+
+    /* ── v25: Boost stats — track vote influence for all tasks ── */
+    if (score > 0) {
+        __u32 bs_idx = DEM_BOOST_STAT_BOOSTED;
+        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
+        if (bs) __sync_fetch_and_add(bs, 1);
+    } else {
+        __u32 bs_idx = DEM_BOOST_STAT_UNBOOSTED;
+        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
+        if (bs) __sync_fetch_and_add(bs, 1);
+    }
+
+    /* ── v25b: RL learning — ALL tasks including institutions ──
+     * Moved before institution routing so institutions participate in RL.
+     * Previously institutions exited before this, so pref tables were
+     * permanently empty on desktop workloads (99% institutions). */
     if (!ts->converged) {
         __u32 zero = 0;
         struct dem_winner *w = bpf_map_lookup_elem(&dem_winner_map, &zero);
@@ -529,26 +694,85 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
             ts->prev_metric = metric;
         }
 
-        if ((ts->runs - ts->converged_at_run) >= DEM_LEARN_CYCLES &&
+        /* v24: Adaptive convergence — learning window grows with experience. */
+        __u32 learn_window = DEM_LEARN_CYCLES_BASE;
+        if (ts->convergence_count > 0) {
+            __u32 shift = ts->convergence_count;
+            if (shift > 3) shift = 3;
+            learn_window = DEM_LEARN_CYCLES_BASE << shift;
+            if (learn_window > DEM_LEARN_CYCLES_MAX)
+                learn_window = DEM_LEARN_CYCLES_MAX;
+        }
+
+        if ((ts->runs - ts->converged_at_run) >= learn_window &&
             !ts->converged) {
             ts->converged = 1;
             ts->converged_at_run = ts->runs;
-            /* v23: merge prefs on every convergence (including re-elections)
-             * so commstate improves over successive learning cycles. */
+            ts->convergence_count++;
+            ts->converged_metric = ts->prev_metric;
+            ts->metric_ema = ts->prev_metric;
             dem_merge_to_commstate(p, ts);
         }
     }
 
-    /* ── v23: Re-election trigger ──
-     * Long-lived tasks that converged long ago may hold stale preferences.
-     * After DEM_RECONVERGE_RUNS dispatches since last convergence, unfreeze
-     * the task so it re-enters the RL learning window for another
-     * DEM_LEARN_CYCLES cycle, then refreezes with updated preferences. */
-    if (ts->converged &&
-        (ts->runs - ts->converged_at_run) >= DEM_RECONVERGE_RUNS) {
-        ts->converged = 0;
-        ts->prev_metric = 0;  /* need fresh metric seed */
-        ts->converged_at_run = ts->runs;  /* anchor for next convergence check */
+    /* ── v24: Metric observation for converged tasks ── */
+    if (ts->converged) {
+        __u32 zero = 0;
+        struct dem_winner *w = bpf_map_lookup_elem(&dem_winner_map, &zero);
+
+        if (w && w->pid != 0 && w->pid != pid) {
+            __u64 my_wait = now - ts->last_run_ts;
+            __u64 metric = (my_wait + w->burst_ns) / 2;
+
+            if (ts->metric_ema == 0)
+                ts->metric_ema = metric;
+            else
+                ts->metric_ema = ts->metric_ema
+                    - (ts->metric_ema >> 2) + (metric >> 2);
+        }
+    }
+
+    /* ── v24: Drift-triggered re-elections ── */
+    if (ts->converged) {
+        bool drift = false;
+
+        if (ts->converged_metric > 0 && ts->metric_ema > 0) {
+            __u64 threshold = ts->converged_metric +
+                              (ts->converged_metric >> DEM_DRIFT_THRESHOLD_SHIFT);
+            if (ts->metric_ema > threshold)
+                drift = true;
+        }
+
+        bool ceiling = (ts->runs - ts->converged_at_run) >= DEM_RECONVERGE_RUNS;
+
+        if (drift || ceiling) {
+            ts->converged = 0;
+            ts->prev_metric = 0;
+            ts->converged_at_run = ts->runs;
+        }
+    }
+
+    /* ── v25b: Institution routing — AFTER RL learning ──
+     * Institutions participate in RL, convergence, and drift detection,
+     * but still route to FALLBACK for low-latency dispatch.
+     * Popular institutions (vote score > 0) get a shorter 1ms slice. */
+    if (ts->institution) {
+        __u64 inst_slice = DEM_SLICE_RT_NS;         /* default 2ms */
+        if (score > 0)
+            inst_slice = (1ULL * 1000000ULL);        /* 1ms for popular */
+        scx_bpf_dsq_insert(p, DEM_DSQ_FALLBACK, inst_slice, enq_flags);
+        return 0;
+    }
+
+    /* ── v24: Institution fast-path for warmstarted tasks ── */
+    if (!ts->institution && ts->avg_burst_ns > 0 &&
+        ts->avg_burst_ns < DEM_INSTITUTION_BURST_NS &&
+        ts->runs < DEM_INSTITUTION_MIN_RUNS) {
+        __u64 inst_slice = DEM_SLICE_RT_NS;
+        if (score > 0)
+            inst_slice = (1ULL * 1000000ULL);
+        scx_bpf_dsq_insert(p, DEM_DSQ_FALLBACK, inst_slice, enq_flags);
+        return 0;
     }
 
     /* ── Starvation rescue (after RL) ── */
@@ -558,14 +782,7 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    __u32 vote_idx = pid & DEM_VOTE_ACCUM_MASK;
-    __u32 *accum = bpf_map_lookup_elem(&dem_vote_accum, &vote_idx);
-    __u32 score = 0;
-    if (accum && *accum > 0) {
-        score = *accum;
-        *accum = 0;
-    }
-
+    /* ── Vtime computation — score already drained in early block ── */
     __u64 vtime = now;
     bool gamemode = dem_gamemode_on();
 
@@ -582,11 +799,6 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         else
             ts->irrelevance = 0;
 
-        /* v20: count boosted enqueue */
-        __u32 bs_idx = DEM_BOOST_STAT_BOOSTED;
-        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
-        if (bs) __sync_fetch_and_add(bs, 1);
-
     } else {
         if (ts->irrelevance < DEM_IRRELEVANCE_CAP)
             ts->irrelevance++;
@@ -598,11 +810,6 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
             __u64 burst_nudge = ts->avg_burst_ns >> 10;
             vtime += burst_nudge;
         }
-
-        /* v20: count unboosted enqueue */
-        __u32 bs_idx = DEM_BOOST_STAT_UNBOOSTED;
-        __u64 *bs = bpf_map_lookup_elem(&dem_boost_stats, &bs_idx);
-        if (bs) __sync_fetch_and_add(bs, 1);
     }
 
     scx_bpf_dsq_insert_vtime(p, DEM_DSQ_DEMOCRATIC,
@@ -698,21 +905,18 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
             bpf_map_update_elem(&dem_warmstart_map, &chash, &ws, BPF_ANY);
         }
 
-        if (ts->institution)
-            return 0;
     }
 
     /* ── v17c: Snapshot write ──
      * Compare this task's last_snapped_sample_id against the global
      * sample_id. If they differ, this task hasn't written a snapshot
      * for the current window yet — do it now and update the marker.
-     * This approach works correctly for ALL tasks regardless of which
-     * task happened to be running when the interval boundary was crossed.
-     * burst and avg_burst_ns are already updated above so data is fresh.
+     * Moved ABOVE institution early-return so ALL tasks (including
+     * institutions) get periodic snapshots for dem_analyze visibility.
      */
     {
-        __u32 zero = 0;
-        struct dem_snap_seq *seq = bpf_map_lookup_elem(&dem_snap_seq_map, &zero);
+        __u32 zero2 = 0;
+        struct dem_snap_seq *seq = bpf_map_lookup_elem(&dem_snap_seq_map, &zero2);
         if (seq && seq->last_snap_ts != 0 &&
             ts->last_snapped_sample_id != seq->sample_id + 1) {
             __u32 vote_idx = pid & DEM_VOTE_ACCUM_MASK;
@@ -724,12 +928,16 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
         }
     }
 
+    /* v25b: Institution early-return removed — institutions now participate
+     * in commstate flush and pref-table voting below. They still get fast
+     * dispatch via institution routing in enqueue(). */
+
     /* ── Step 1b: v20 periodic commstate flush ──
      * Long-lived tasks never hit exit_task, so they'd never contribute
      * learned prefs to shared state. Flush every DEM_FLUSH_INTERVAL_RUNS
      * so commstate warms up while tasks are alive.
      */
-    if (!ts->institution && ts->runs > 0 &&
+    if (!ts->converged && ts->runs > 0 &&
         (ts->runs % DEM_FLUSH_INTERVAL_RUNS) == 0) {
         dem_merge_to_commstate(p, ts);
     }
@@ -783,7 +991,7 @@ int SCX_OPS(democratic_exit_task, struct task_struct *p,
     struct dem_tstate *ts = dem_get(p);
 
     /* ── v18/v20: Merge learned preferences into shared comm state ── */
-    if (ts && !ts->institution && (ts->converged || ts->runs > DEM_COMMSTATE_MERGE_MIN_RUNS)) {
+    if (ts && (ts->converged || ts->runs > DEM_COMMSTATE_MERGE_MIN_RUNS)) {
         dem_merge_to_commstate(p, ts);
     }
 
@@ -798,7 +1006,7 @@ int SCX_OPS(democratic_exit_task, struct task_struct *p,
 
 int SCX_OPS(democratic_exit, struct scx_exit_info *ei)
 {
-    bpf_printk("democratic v23: unloading\n");
+    bpf_printk("democratic v25: unloading\n");
     scx_bpf_destroy_dsq(DEM_DSQ_RT);
     scx_bpf_destroy_dsq(DEM_DSQ_DEMOCRATIC);
     scx_bpf_destroy_dsq(DEM_DSQ_FALLBACK);
@@ -809,6 +1017,7 @@ SEC(".struct_ops")
 struct sched_ext_ops democratic_ops = {
     .init        = (void *)democratic_init,
     .init_task   = (void *)democratic_init_task,
+    .select_cpu  = (void *)democratic_select_cpu,
     .enqueue     = (void *)democratic_enqueue,
     .dispatch    = (void *)democratic_dispatch,
     .running     = (void *)democratic_running,
