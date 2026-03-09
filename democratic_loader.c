@@ -1,3 +1,39 @@
+/* democratic_loader.c — v25
+ * Loads the democratic v25 scheduler BPF object and optionally seeds the
+ * static vote map as a bootstrap hint. Reinforcement learning in the BPF
+ * program builds per-task preferences; institutions bypass elections entirely
+ * but still vote for their wakers via universal suffrage (v25).
+ *
+ * New in v25:
+ *   - Compatible with v25 BPF: universal suffrage — every woken task,
+ *     including institutions, votes for its waker via waker identity
+ *     captured in select_cpu(). RT lane counter for observability.
+ *     Commstate flush guard for converged tasks.
+ *
+ * New in v24:
+ *   - Compatible with v24 BPF: adaptive convergence (exponential learning
+ *     windows 2→4→8→16), institution fast-path for warmstarted tasks,
+ *     drift-triggered re-elections (50% metric degradation threshold),
+ *     select_cpu idle fast-path for wakeup latency reduction.
+ *   - DEM_RECONVERGE_RUNS raised to 128 (safety ceiling; drift handles normal).
+ *   - DEM_INSTITUTION_MIN_RUNS lowered to 2.
+ *
+ * New in v18:
+ *   - Compatible with v18 BPF (shared preference state via dem_commstate_map).
+ *   - Automatically saves and loads shared preferences to/from disk at
+ *     /tmp/democratic_commstate to preserve memory across reboots/restarts.
+ *
+ * New in v8:
+ *   - Compatible with v17 BPF (snapshot map for preference drift analysis).
+ *   - Pins dem_snapshot_map and dem_snap_seq_map to /sys/fs/bpf/ after load.
+ *
+ * Usage:
+ *   sudo ./democratic_loader democratic.bpf.o [workload_pid] [--gamemode]
+ *
+ * If no PID given, watches for game_* threads system-wide.
+ * Send SIGUSR1 to toggle gamemode at runtime.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -401,8 +437,9 @@ int main(int argc, char **argv)
 
     printf("\n");
     printf("══════════════════════════════════════════════════════\n");
-    printf("  Democratic CPU Scheduler — BPF Loader v18\n");
-    printf("  (v18: shared preference memory across reboots)\n");
+    printf("  Democratic CPU Scheduler — BPF Loader v25\n");
+    printf("  (v25: universal suffrage + waker identity\n");
+    printf("         + institution fast-path + select_cpu)\n");
     printf("══════════════════════════════════════════════════════\n");
     printf("  BPF object : %s\n", bpf_obj_path);
     if (watch_pid)
@@ -561,7 +598,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("  Democratic scheduler v18 ACTIVE%s\n",
+    printf("  Democratic scheduler v25 ACTIVE%s\n",
            gamemode ? " [GAMEMODE]" : "");
     printf("  Press Ctrl+C to stop and revert to BORE\n");
     printf("══════════════════════════════════════════════════════\n\n");
@@ -577,7 +614,7 @@ int main(int argc, char **argv)
             printf("  Bootstrap vote registrations: %d/%d threads wired up\n",
                    reg, N_KNOWN_THREADS);
             if (reg > 0)
-                printf("  (reinforcement learning will build preferences over ~128 runs)\n");
+                printf("  (reinforcement learning will build preferences over ~2-16 runs)\n");
 
             /* Print exactly which TIDs are voting for what */
             if (reg > 0) {
@@ -639,6 +676,6 @@ int main(int argc, char **argv)
 
     bpf_link__destroy(link);
     bpf_object__close(obj);
-    printf("\n  Democratic scheduler v19 unloaded. Reverted to BORE.\n\n");
+    printf("\n  Democratic scheduler v25 unloaded. Reverted to BORE.\n\n");
     return 0;
 }
