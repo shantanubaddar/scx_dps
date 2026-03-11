@@ -1,30 +1,18 @@
 # scx_dps
 A scheduler written under the kernel framework sched-ex that works on the basis of processes voting for each other in order to decide who gets the CPU-slice - Democratic Process Scheduler (DPS)
 
-Hackbench test (Throughput)
-<img width="1485" height="883" alt="hackbench_throughput" src="https://github.com/user-attachments/assets/df06f380-62cd-44fa-8188-15f7743543cf" />
 
-Sysbench test (CPU)
 
-<img width="1485" height="883" alt="sysbench_cpu" src="https://github.com/user-attachments/assets/f675714c-29ad-43e8-9ab5-a3e26993c825" />
+<img width="1750" height="739" alt="1_hackbench" src="https://github.com/user-attachments/assets/ef586b9f-501a-444d-a611-6ec4e5aa7b4b" />
 
-Sysbench test (Memory)
+<img width="1749" height="790" alt="2_cyclictest" src="https://github.com/user-attachments/assets/46cf723c-6209-4c7f-9290-7f6621da708a" />
 
-<img width="1485" height="883" alt="sysbench_memory" src="https://github.com/user-attachments/assets/5a0ded51-47c4-4565-b7ff-863236530f50" />
+<img width="1749" height="788" alt="3_schbench_wakeup_percentiles" src="https://github.com/user-attachments/assets/65eef311-eeef-4c02-ae07-f4b8eea005ea" />
 
-Schbench test (Latency)
+<img width="1750" height="788" alt="4_schbench_request_latency" src="https://github.com/user-attachments/assets/ef14bd37-3ca2-401a-ab80-e60084e487ee" />
 
-<img width="1485" height="883" alt="schbench_latency" src="https://github.com/user-attachments/assets/6c6d8a40-4526-4e94-a125-8f7f8ff1b309" />
+<img width="1750" height="737" alt="5_schbench_rps" src="https://github.com/user-attachments/assets/9fb01465-7e40-425c-8339-91e61a1eae74" />
 
-Schbench test (Requests Per Second)
+<img width="2390" height="786" alt="6_schbench_wakeup_evolution_load" src="https://github.com/user-attachments/assets/a63a8278-e38e-40a8-b096-9100fe1bbc76" />
 
-<img width="1485" height="883" alt="schbench_rps" src="https://github.com/user-attachments/assets/7cf620cc-0297-4f37-a32b-ba4c2b4c58a0" />
-
-Cyclictest Latency
-
-<img width="2085" height="885" alt="cyclictest_latency" src="https://github.com/user-attachments/assets/6f43a1c3-c166-4442-ade9-97bd4c56797b"/>
-
-Summary
-
-<img width="1440" height="1033" alt="summary_table" src="https://github.com/user-attachments/assets/5d45db1c-4329-4896-811f-ebd9cf2becc2" />
-
+<img width="2390" height="786" alt="7_schbench_wakeup_evolution_clean" src="https://github.com/user-attachments/assets/a07ac414-f02d-414f-bdab-3b06b78d7252" />
