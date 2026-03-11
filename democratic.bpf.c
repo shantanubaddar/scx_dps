@@ -480,26 +480,50 @@ int SCX_OPS(democratic_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
         struct task_struct *waker = (struct task_struct *)bpf_get_current_task();
         __u32 wpid = BPF_CORE_READ(waker, pid);
         __u32 my_pid = BPF_CORE_READ(p, pid);
-        if (wpid != 0 && wpid != my_pid)
+        if (wpid != 0 && wpid != my_pid) {
             ts->waker_pid = wpid;
+
+            /* v25c: Waker voting moved here from enqueue().
+             * Since select_cpu() now always inserts to SCX_DSQ_LOCAL,
+             * woken tasks bypass enqueue() entirely, so the vote must
+             * fire here while we still have the waker context. */
+            __u32 vidx = wpid & DEM_VOTE_ACCUM_MASK;
+            __u32 *va = bpf_map_lookup_elem(&dem_vote_accum, &vidx);
+            if (va)
+                __sync_fetch_and_add(va, 1);
+            __sync_fetch_and_add(&ts->votes_fired, 1);
+        }
     }
 
     cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-    if (is_idle) {
-        /* Idle CPU found — direct dispatch, bypass enqueue entirely.
-         * Use RT slice for institutions, normal slice otherwise. */
+    {
+        /* v25c: Always dispatch woken tasks directly to SCX_DSQ_LOCAL.
+         *
+         * Previously, only idle CPUs got direct local dispatch; busy CPUs
+         * received just a SCX_KICK_PREEMPT.  The task then entered enqueue(),
+         * landed in the global DEM_DSQ_FALLBACK, waited for the kicked CPU's
+         * dispatch() callback to pull it via scx_bpf_dsq_move_to_local().
+         * That 3-hop path added ~1.7ms latency (our schbench p50 = 1714µs).
+         *
+         * For busy CPUs, we only kick-preempt when the woken task has been
+         * sleeping long enough to suggest it's latency-sensitive (e.g.
+         * schbench workers waiting for messages).  Tasks that cycle rapidly
+         * with near-zero sleep (e.g. hackbench send/recv) skip the kick
+         * to avoid thousands of forced preemptions per second that destroy
+         * throughput.  200µs threshold: hackbench cycles in <50µs,
+         * schbench workers sleep for 1-5ms between messages. */
         __u64 slice = DEM_SLICE_NS;
         if (ts && ts->institution)
             slice = DEM_SLICE_RT_NS;
 
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
-    } else {
-        /* v25b: No idle CPU — preempt to avoid waiting for full timeslice.
-         * Without this, woken tasks sit in the global DSQ until the running
-         * task's slice expires (~2-5ms), causing schbench p50 of ~3ms.
-         * SCX_KICK_PREEMPT forces an immediate reschedule on the target CPU. */
-        scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+
+        if (!is_idle && ts) {
+            __u64 sleep_ns = bpf_ktime_get_ns() - ts->last_run_ts;
+            if (sleep_ns > 200000ULL)  /* 200µs */
+                scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+        }
     }
 
     return cpu;
@@ -535,13 +559,10 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    /* ── v25: Universal waker voting ──
-     * Every woken task — including institutions — votes for its waker.
-     * select_cpu() stored the waker PID in ts->waker_pid (it runs in
-     * the waker's context).  This is the democratic "micro-election":
-     * institutions don't need multi-round RL to participate — one
-     * wakeup = one vote.  The vote goes into the same accumulator
-     * that boosts vtime for tasks in the democratic queue. */
+    /* ── v25c: Waker voting moved to select_cpu() ──
+     * Since woken tasks now bypass enqueue (direct local dispatch in
+     * select_cpu), waker voting fires there.  This block is kept as a
+     * fallback for any edge case where a wakeup enters enqueue. */
     if ((enq_flags & 1ULL) && ts->waker_pid != 0 && ts->waker_pid != pid) {
         __u32 vote_idx = ts->waker_pid & DEM_VOTE_ACCUM_MASK;
         __u32 *va = bpf_map_lookup_elem(&dem_vote_accum, &vote_idx);
