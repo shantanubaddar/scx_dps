@@ -73,6 +73,8 @@ char _license[] SEC("license") = "GPL";
 /* Max snapshot entries: 60 samples × 512 tasks per sample (v21: doubled from 30) */
 #define DEM_SNAPSHOT_MAX_ENTRIES  (60 * 512)
 
+/* ── Queue-pressure scaling (v26) — REMOVED in v27 ── */
+
 #define DEM_DSQ_RT           0ULL
 #define DEM_DSQ_DEMOCRATIC   1ULL
 #define DEM_DSQ_FALLBACK     2ULL
@@ -105,7 +107,8 @@ struct dem_tstate {
     __u64 prev_metric;
     __u8  converged;           /* 0 = learning, 1 = frozen */
     __u8  institution;         /* 1 = short-burst task, bypasses elections */
-    __u8  _pad[2];
+    __u8  bursty;              /* v27: 1 = burst < global avg/2, skip commstate merge */
+    __u8  _pad;
     __u32 convergence_count;   /* v24: how many times this task has converged */
     __u32 converged_at_run;    /* v23: run count when last converged, for re-election */
     __u64 converged_metric;    /* v24: metric snapshot at convergence — drift baseline */
@@ -261,6 +264,11 @@ struct {
     __type(value, __u64);
 } dem_boost_stats SEC(".maps");
 
+/* v27: Global burst EMA — tracks system-wide average burst time.
+ * Tasks whose avg_burst_ns < half this are tagged bursty and excluded
+ * from commstate merging to prevent ephemeral workload pollution. */
+static volatile __u64 dem_avg_burst_global = 0;
+
 /* ── Helpers ── */
 
 static __always_inline struct dem_tstate *dem_get(struct task_struct *p)
@@ -414,7 +422,8 @@ int SCX_OPS_SLEEPABLE(democratic_init)
     e = scx_bpf_create_dsq(DEM_DSQ_RT,         -1); if (e) return e;
     e = scx_bpf_create_dsq(DEM_DSQ_DEMOCRATIC, -1); if (e) return e;
     e = scx_bpf_create_dsq(DEM_DSQ_FALLBACK,   -1); if (e) return e;
-    bpf_printk("democratic v25: universal suffrage + waker identity\n");
+
+    bpf_printk("democratic v29: loser rescue + bursty-gated dispatch\n");
     return 0;
 }
 
@@ -484,7 +493,7 @@ int SCX_OPS(democratic_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
             ts->waker_pid = wpid;
 
             /* v25c: Waker voting moved here from enqueue().
-             * Since select_cpu() now always inserts to SCX_DSQ_LOCAL,
+             * Since select_cpu() always inserts to SCX_DSQ_LOCAL,
              * woken tasks bypass enqueue() entirely, so the vote must
              * fire here while we still have the waker context. */
             __u32 vidx = wpid & DEM_VOTE_ACCUM_MASK;
@@ -498,32 +507,33 @@ int SCX_OPS(democratic_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
     {
-        /* v25c: Always dispatch woken tasks directly to SCX_DSQ_LOCAL.
+        /* v28: Bursty-gated dispatch.
+         * Non-bursty tasks → SCX_DSQ_LOCAL (fast, cache-hot local dispatch).
+         * Bursty tasks → skip insert, fall through to enqueue() which routes
+         * them to DEM_DSQ_FALLBACK — a global DSQ any idle CPU can pull from.
+         * This prevents load imbalance on make -jN where the waker's CPU
+         * accumulates all forked compiler tasks while other CPUs starve.
          *
-         * Previously, only idle CPUs got direct local dispatch; busy CPUs
-         * received just a SCX_KICK_PREEMPT.  The task then entered enqueue(),
-         * landed in the global DEM_DSQ_FALLBACK, waited for the kicked CPU's
-         * dispatch() callback to pull it via scx_bpf_dsq_move_to_local().
-         * That 3-hop path added ~1.7ms latency (our schbench p50 = 1714µs).
-         *
-         * For busy CPUs, we only kick-preempt when the woken task has been
-         * sleeping long enough to suggest it's latency-sensitive (e.g.
-         * schbench workers waiting for messages).  Tasks that cycle rapidly
-         * with near-zero sleep (e.g. hackbench send/recv) skip the kick
-         * to avoid thousands of forced preemptions per second that destroy
-         * throughput.  200µs threshold: hackbench cycles in <50µs,
-         * schbench workers sleep for 1-5ms between messages. */
-        __u64 slice = DEM_SLICE_NS;
-        if (ts && ts->institution)
-            slice = DEM_SLICE_RT_NS;
+         * Institutions get 2ms slices; normal tasks get 5ms.
+         * Kick-preempt on busy CPUs only for latency-sensitive wakeups
+         * (sleep > 200µs). */
+        bool bursty = ts && ts->bursty;
 
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+        if (!bursty) {
+            __u64 slice = DEM_SLICE_NS;                       /* 5ms base */
+            if (ts && ts->institution)
+                slice = DEM_SLICE_RT_NS;                       /* 2ms for institutions */
 
-        if (!is_idle && ts) {
-            __u64 sleep_ns = bpf_ktime_get_ns() - ts->last_run_ts;
-            if (sleep_ns > 200000ULL)  /* 200µs */
-                scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+            scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+
+            if (!is_idle && ts) {
+                __u64 sleep_ns = bpf_ktime_get_ns() - ts->last_run_ts;
+                if (sleep_ns > 200000ULL)                      /* 200µs threshold */
+                    scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+            }
         }
+        /* bursty tasks: no insert here — they fall through to enqueue()
+         * where institution routing dispatches to DEM_DSQ_FALLBACK (global). */
     }
 
     return cpu;
@@ -559,10 +569,10 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
         return 0;
     }
 
-    /* ── v25c: Waker voting moved to select_cpu() ──
-     * Since woken tasks now bypass enqueue (direct local dispatch in
-     * select_cpu), waker voting fires there.  This block is kept as a
-     * fallback for any edge case where a wakeup enters enqueue. */
+    /* ── v28: Waker voting for tasks reaching enqueue ──
+     * Non-bursty woken tasks are dispatched locally in select_cpu() and
+     * vote there.  Bursty tasks skip local dispatch and land here, so
+     * their waker vote fires now. */
     if ((enq_flags & 1ULL) && ts->waker_pid != 0 && ts->waker_pid != pid) {
         __u32 vote_idx = ts->waker_pid & DEM_VOTE_ACCUM_MASK;
         __u32 *va = bpf_map_lookup_elem(&dem_vote_accum, &vote_idx);
@@ -606,6 +616,7 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
 
         if (w && w->pid != 0 && w->pid != pid) {
             __u64 my_wait = now - ts->last_run_ts;
+
             __u64 metric = (my_wait + w->burst_ns) / 2;
 
             if (ts->prev_metric > 0) {
@@ -666,7 +677,9 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
             ts->convergence_count++;
             ts->converged_metric = ts->prev_metric;
             ts->metric_ema = ts->prev_metric;
-            dem_merge_to_commstate(p, ts);
+            /* v27: bursty tasks don't merge — prevent commstate pollution */
+            if (!ts->bursty)
+                dem_merge_to_commstate(p, ts);
         }
     }
 
@@ -709,7 +722,7 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
 
     /* ── v25b: Institution routing — AFTER RL learning ──
      * Institutions participate in RL, convergence, and drift detection,
-     * but still route to FALLBACK for low-latency dispatch.
+     * but still route to FALLBACK (or GLOBAL under pressure) for dispatch.
      * Popular institutions (vote score > 0) get a shorter 1ms slice. */
     if (ts->institution) {
         __u64 inst_slice = DEM_SLICE_RT_NS;         /* default 2ms */
@@ -757,6 +770,23 @@ int SCX_OPS(democratic_enqueue, struct task_struct *p, u64 enq_flags)
     } else {
         if (ts->irrelevance < DEM_IRRELEVANCE_CAP)
             ts->irrelevance++;
+
+        /* v29: Loser rescue — when the system has spare capacity, route
+         * a fraction (~12.5%) of unvoted tasks to FALLBACK with short
+         * institution-like slices instead of penalizing them into the
+         * democratic queue tail.  Tightens request latency p90/p99
+         * without affecting voted-task priority.
+         *
+         * "Spare capacity" = this task ran within the last 5ms,
+         * meaning it got served within one base slice — the system
+         * isn't congested.  Under load, wait times stretch and this
+         * condition stops firing, preserving full democratic ordering. */
+        if ((ts->runs & 0x7) == 0 &&
+            (now - ts->last_run_ts) < DEM_SLICE_NS) {
+            scx_bpf_dsq_insert(p, DEM_DSQ_FALLBACK, DEM_SLICE_RT_NS,
+                                enq_flags);
+            return 0;
+        }
 
         __u64 penalty = (__u64)ts->irrelevance * DEM_PENALTY_NS;
         vtime = now + penalty;
@@ -846,6 +876,24 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
             ts->avg_burst_ns = ts->avg_burst_ns
                 - (ts->avg_burst_ns >> 2) + (burst >> 2);
 
+        /* v27: Update global burst EMA and set bursty flag.
+         * EMA weight: 1/8 new, 7/8 old (shift 3).
+         * A task is bursty if its avg burst is less than half the global. */
+        {
+            __u64 old_g = dem_avg_burst_global;
+            if (old_g == 0)
+                dem_avg_burst_global = burst;
+            else
+                dem_avg_burst_global = old_g - (old_g >> 3) + (burst >> 3);
+
+            if (ts->runs >= DEM_INSTITUTION_MIN_RUNS &&
+                dem_avg_burst_global > 0 &&
+                ts->avg_burst_ns < (dem_avg_burst_global >> 1))
+                ts->bursty = 1;
+            else
+                ts->bursty = 0;
+        }
+
         if (!ts->institution && ts->runs >= DEM_INSTITUTION_MIN_RUNS &&
             ts->avg_burst_ns < DEM_INSTITUTION_BURST_NS) {
             ts->institution = 1;
@@ -894,7 +942,7 @@ int SCX_OPS(democratic_stopping, struct task_struct *p, bool runnable)
      * learned prefs to shared state. Flush every DEM_FLUSH_INTERVAL_RUNS
      * so commstate warms up while tasks are alive.
      */
-    if (!ts->converged && ts->runs > 0 &&
+    if (!ts->converged && !ts->bursty && ts->runs > 0 &&
         (ts->runs % DEM_FLUSH_INTERVAL_RUNS) == 0) {
         dem_merge_to_commstate(p, ts);
     }
@@ -947,8 +995,11 @@ int SCX_OPS(democratic_exit_task, struct task_struct *p,
     __u32 pid = BPF_CORE_READ(p, pid);
     struct dem_tstate *ts = dem_get(p);
 
-    /* ── v18/v20: Merge learned preferences into shared comm state ── */
-    if (ts && (ts->converged || ts->runs > DEM_COMMSTATE_MERGE_MIN_RUNS)) {
+    /* ── v18/v20/v27: Merge learned preferences into shared comm state ──
+     * v27: bursty tasks excluded — their ephemeral PID-based preferences
+     * would pollute commstate with transient relationships. */
+    if (ts && !ts->bursty &&
+        (ts->converged || ts->runs > DEM_COMMSTATE_MERGE_MIN_RUNS)) {
         dem_merge_to_commstate(p, ts);
     }
 
@@ -963,7 +1014,7 @@ int SCX_OPS(democratic_exit_task, struct task_struct *p,
 
 int SCX_OPS(democratic_exit, struct scx_exit_info *ei)
 {
-    bpf_printk("democratic v25: unloading\n");
+    bpf_printk("democratic v29: unloading\n");
     scx_bpf_destroy_dsq(DEM_DSQ_RT);
     scx_bpf_destroy_dsq(DEM_DSQ_DEMOCRATIC);
     scx_bpf_destroy_dsq(DEM_DSQ_FALLBACK);
