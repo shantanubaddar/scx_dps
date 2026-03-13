@@ -20,8 +20,22 @@
 /* Must match democratic.bpf.c exactly */
 #define DEM_MAX_VOTES   8
 #define DEM_PREF_SLOTS  16
-#define DEM_WARMSTATE_PATH "/tmp/democratic_warmstate"
-#define DEM_COMMSTATE_PATH "/tmp/democratic_commstate"
+#define DEM_STATE_DIR      "/var/lib/scx_dps"
+#define DEM_WARMSTATE_PATH "/var/lib/scx_dps/warmstate"
+#define DEM_COMMSTATE_PATH "/var/lib/scx_dps/commstate"
+
+/* Ensure the state directory exists. Called once at startup.
+ * Uses 0755 so non-root users can read the files for inspection,
+ * but only root (the loader runs as root) can write them. */
+static void ensure_state_dir(void)
+{
+    struct stat st;
+    if (stat(DEM_STATE_DIR, &st) == 0)
+        return;  /* already exists */
+    if (mkdir(DEM_STATE_DIR, 0755) != 0 && errno != EEXIST)
+        printf("  Warning: could not create %s: %s\n",
+               DEM_STATE_DIR, strerror(errno));
+}
 
 struct dem_vprefs {
     __u32 preferred[DEM_MAX_VOTES];
@@ -401,9 +415,9 @@ int main(int argc, char **argv)
 
     printf("\n");
     printf("══════════════════════════════════════════════════════\n");
-    printf("  Democratic CPU Scheduler — BPF Loader v25\n");
-    printf("  (v25: universal suffrage + waker identity\n");
-    printf("         + institution fast-path + select_cpu)\n");
+    printf("  Democratic CPU Scheduler — BPF Loader v28\n");
+    printf("  (v28: bursty-gated dispatch — bursty→global,\n");
+    printf("         non-bursty→local)\n");
     printf("══════════════════════════════════════════════════════\n");
     printf("  BPF object : %s\n", bpf_obj_path);
     if (watch_pid)
@@ -532,6 +546,9 @@ int main(int argc, char **argv)
         }
     }
 
+    /* ── Ensure persistent state directory exists ── */
+    ensure_state_dir();
+
     /* ── Load warm start data before attaching ── */
     if (warmstart_map_fd >= 0) {
         load_warmstate(warmstart_map_fd);
@@ -562,7 +579,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("  Democratic scheduler v25 ACTIVE%s\n",
+    printf("  Democratic scheduler v28 ACTIVE%s\n",
            gamemode ? " [GAMEMODE]" : "");
     printf("  Press Ctrl+C to stop and revert to BORE\n");
     printf("══════════════════════════════════════════════════════\n\n");
@@ -640,6 +657,6 @@ int main(int argc, char **argv)
 
     bpf_link__destroy(link);
     bpf_object__close(obj);
-    printf("\n  Democratic scheduler v25 unloaded. Reverted to BORE.\n\n");
+    printf("\n  Democratic scheduler v28 unloaded. Reverted to BORE.\n\n");
     return 0;
 }
