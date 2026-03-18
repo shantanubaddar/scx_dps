@@ -3,13 +3,12 @@ A scheduler written under the kernel framework sched-ext that works on the basis
 
 
 
-<img width="1485" height="883" alt="hackbench_throughput" src="https://github.com/user-attachments/assets/05d51710-b8ef-44a5-ba78-ae65b30c9dbc" />
-<img width="1485" height="883" alt="sysbench_cpu" src="https://github.com/user-attachments/assets/a6261179-7bc4-46aa-a421-34462482ce62" />
-<img width="1485" height="883" alt="schbench_latency" src="https://github.com/user-attachments/assets/ad4eff0e-d666-4533-8efe-d1d5fc1c9a13" />
-<img width="1485" height="883" alt="sysbench_memory" src="https://github.com/user-attachments/assets/5769c474-b7de-407d-804f-2664c1f00214" />
-<img width="1485" height="883" alt="schbench_rps" src="https://github.com/user-attachments/assets/b0e13c1a-2a21-4bd1-9c71-18515251377e" />
-<img width="2085" height="885" alt="cyclictest_latency" src="https://github.com/user-attachments/assets/820354d6-5dcf-4ca4-984f-186fc34630d2" />
-<img width="2574" height="1183" alt="summary_table" src="https://github.com/user-attachments/assets/3ec0c7a9-d52c-4830-8d30-fda635bfdf8d" />
+<img width="1398" height="743" alt="1_schbench_percentiles" src="https://github.com/user-attachments/assets/7f0ab40c-54f5-4013-90c0-82161af91448" />
+<img width="1270" height="712" alt="2_hackbench_scaling" src="https://github.com/user-attachments/assets/bff2257a-f176-433c-9557-ea3ba3deae83" />
+<img width="1293" height="628" alt="3_cyclictest_max" src="https://github.com/user-attachments/assets/460b816b-cce0-4040-ae03-dece53a7757e" />
+
+<img width="1784" height="688" alt="4_sysbench" src="https://github.com/user-attachments/assets/8d71eb1f-d03c-4c60-8c01-e36b64437515" />
+<img width="1072" height="979" alt="5_radar_summary" src="https://github.com/user-attachments/assets/0399e06e-d28b-4fd4-b991-86d962136fc8" />
 
 
 ---
